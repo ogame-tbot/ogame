@@ -92,6 +92,7 @@ type OGame struct {
 	tasksPushCh           chan *item
 	tasksPopCh            chan struct{}
 	loginWrapper          func(func() (bool, error)) error
+	getServerDataWrapper  func(func() (ServerData, error)) (ServerData, error)
 	loginProxyTransport   http.RoundTripper
 	bytesUploaded         int64
 	bytesDownloaded       int64
@@ -388,11 +389,12 @@ func AddAccount(lobby, username, password, otpSecret, universe, lang string, cli
 		}
 	}
 	var payload struct {
-		Language string `json:"language"`
-		Number   int64  `json:"number"`
+		AccountGroup string `json:"accountGroup"`
+		Locale       string `json:"locale"`
+		Kid          string `json:"kid"`
 	}
-	payload.Language = lang
-	payload.Number = server.Number
+	payload.AccountGroup = server.AccountGroup
+	payload.Locale = "en_GB"
 	jsonPayloadBytes, err := json.Marshal(&payload)
 	if err != nil {
 		return newAccount, err
@@ -469,6 +471,7 @@ func NewWithParams(params Params) (*OGame, error) {
 // NewNoLogin does not auto login.
 func NewNoLogin(username, password, otpSecret, bearerToken, universe, lang, cookiesFilename string, playerID int64, client *OGameClient) (*OGame, error) {
 	b := new(OGame)
+	b.getServerDataWrapper = DefaultGetServerDataWrapper
 	b.loginWrapper = DefaultLoginWrapper
 	b.Enable()
 	b.quiet = false
@@ -480,7 +483,7 @@ func NewNoLogin(username, password, otpSecret, bearerToken, universe, lang, cook
 	b.language = lang
 	b.playerID = playerID
 
-	b.extractor = NewExtractorV71()
+	b.extractor = NewExtractorV874()
 
 	if client == nil {
 		jar, err := cookiejar.New(&cookiejar.Options{
@@ -521,6 +524,7 @@ func NewNoLogin(username, password, otpSecret, bearerToken, universe, lang, cook
 type Server struct {
 	Language      string
 	Number        int64
+	AccountGroup  string
 	Name          string
 	PlayerCount   int64
 	PlayersOnline int64
@@ -793,7 +797,6 @@ type ServerData struct {
 	RepairFactor                  float64 `xml:"repairFactor"`                  // 0.7
 	NewbieProtectionLimit         int64   `xml:"newbieProtectionLimit"`         // 500000
 	NewbieProtectionHigh          int64   `xml:"newbieProtectionHigh"`          // 50000
-	TopScore                      int64   `xml:"topScore"`                      // 60259362
 	BonusFields                   int64   `xml:"bonusFields"`                   // 30
 	DonutGalaxy                   bool    `xml:"donutGalaxy"`                   // 1
 	DonutSystem                   bool    `xml:"donutSystem"`                   // 1
@@ -807,6 +810,7 @@ type ServerData struct {
 	ResearchDurationDivisor       int64   `xml:"researchDurationDivisor"`       // 2
 	DarkMatterNewAcount           int64   `xml:"darkMatterNewAcount"`           // 8000
 	CargoHyperspaceTechMultiplier int64   `xml:"cargoHyperspaceTechMultiplier"` // 5
+	//TopScore                      int64   `xml:"topScore"`                      // 60259362 / 1.0363090034999E+17
 }
 
 // gets the server data from xml api
@@ -1133,14 +1137,14 @@ func postSessions(b *OGame, gameEnvironmentID, platformGameID, username, passwor
 		}
 		defer resp.Body.Close()
 
-		if resp.StatusCode == 409 {
+		if resp.StatusCode == http.StatusConflict {
 			// Question: https://image-drop-challenge.gameforge.com/challenge/c434aa65-a064-498f-9ca4-98054bab0db8/en-GB/text
 			// Icons:    https://image-drop-challenge.gameforge.com/challenge/c434aa65-a064-498f-9ca4-98054bab0db8/en-GB/drag-icons
 			// POST:     https://image-drop-challenge.gameforge.com/challenge/c434aa65-a064-498f-9ca4-98054bab0db8/en-GB {"answer":2} // 0 indexed
 			//           {"id":"c434aa65-a064-498f-9ca4-98054bab0db8","lastUpdated":1611749410077,"status":"solved"}
-			gfChallengeID := resp.Header.Get(gfChallengeID) // c434aa65-a064-498f-9ca4-98054bab0db8;https://challenge.gameforge.com
-			if gfChallengeID != "" {
-				parts := strings.Split(gfChallengeID, ";")
+			gfChallengeIDValue := resp.Header.Get(gfChallengeID) // c434aa65-a064-498f-9ca4-98054bab0db8;https://challenge.gameforge.com
+			if gfChallengeIDValue != "" {
+				parts := strings.Split(gfChallengeIDValue, ";")
 				challengeID = parts[0]
 
 				if tried {
@@ -1167,12 +1171,12 @@ func postSessions(b *OGame, gameEnvironmentID, platformGameID, username, passwor
 			}
 		}
 
-		if resp.StatusCode >= 500 {
+		if resp.StatusCode >= http.StatusInternalServerError {
 			return out, errors.New("OGame server error code : " + resp.Status)
 		}
 
 		by, _, err := readBody(resp)
-		if resp.StatusCode != 201 {
+		if resp.StatusCode != http.StatusCreated {
 			if string(by) == `{"reason":"OTP_REQUIRED"}` {
 				return out, ErrOTPRequired
 			}
@@ -1243,6 +1247,8 @@ func solveChallenge(client *http.Client, challengeID string, answer int64) error
 	if err != nil {
 		return err
 	}
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, resp.Body)
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("failed to solve captcha (%s)", resp.Status)
 	}
@@ -1391,7 +1397,7 @@ func (b *OGame) loginPart2(server Server, userAccount account) error {
 	// Get server data
 	start := time.Now()
 	b.server = server
-	serverData, err := b.getServerData()
+	serverData, err := b.getServerDataWrapper(b.getServerData)
 	if err != nil {
 		return err
 	}
@@ -1420,7 +1426,11 @@ func (b *OGame) loginPart2(server Server, userAccount account) error {
 
 func (b *OGame) loginPart3(userAccount account, pageHTML []byte) error {
 	if ogVersion, err := version.NewVersion(b.serverData.Version); err == nil {
-		if ogVersion.GreaterThanOrEqual(version.Must(version.NewVersion("7.1.0-rc0"))) {
+		if ogVersion.GreaterThanOrEqual(version.Must(version.NewVersion("8.7.4"))) {
+			b.extractor = NewExtractorV874()
+		} else if ogVersion.GreaterThanOrEqual(version.Must(version.NewVersion("8.0.0"))) {
+			b.extractor = NewExtractorV8()
+		} else if ogVersion.GreaterThanOrEqual(version.Must(version.NewVersion("7.1.0-rc0"))) {
 			b.extractor = NewExtractorV71()
 		} else if ogVersion.GreaterThanOrEqual(version.Must(version.NewVersion("7.0.0-rc0"))) {
 			b.extractor = NewExtractorV7()
@@ -1502,6 +1512,11 @@ func (b *OGame) cacheFullPageInfo(page string, pageHTML []byte) {
 	}
 }
 
+// DefaultGetServerDataWrapper ...
+var DefaultGetServerDataWrapper = func(getServerDataFn func() (ServerData, error)) (ServerData, error) {
+	return getServerDataFn()
+}
+
 // DefaultLoginWrapper ...
 var DefaultLoginWrapper = func(loginFn func() (bool, error)) error {
 	_, err := loginFn()
@@ -1546,6 +1561,11 @@ func (b *OGame) setOGameLobby(lobby string) {
 		lobby = Lobby
 	}
 	b.lobby = lobby
+}
+
+// SetGetServerDataWrapper ...
+func (b *OGame) SetGetServerDataWrapper(newWrapper func(func() (ServerData, error)) (ServerData, error)) {
+	b.getServerDataWrapper = newWrapper
 }
 
 // SetLoginWrapper ...
@@ -1638,7 +1658,7 @@ func (b *OGame) SetProxy(proxyAddress, username, password, proxyType string, log
 }
 
 func (b *OGame) connectChat(host, port string) {
-	if b.IsV8() {
+	if b.IsV8() || b.IsV9() {
 		b.connectChatV8(host, port)
 	} else {
 		b.connectChatV7(host, port)
@@ -1692,7 +1712,7 @@ func (b *OGame) connectChatV8(host, port string) {
 		b.error("failed to dial websocket:", err)
 		return
 	}
-	_, _ = b.ws.Write([]byte("2probe"))
+	_ = websocket.Message.Send(b.ws, "2probe")
 
 	// Recv msgs
 LOOP:
@@ -1703,11 +1723,11 @@ LOOP:
 		default:
 		}
 
-		var buf = make([]byte, 1024*1024)
+		var buf string
 		if err := b.ws.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
 			b.error("failed to set read deadline:", err)
 		}
-		n, err := b.ws.Read(buf)
+		err := websocket.Message.Receive(b.ws, &buf)
 		if err != nil {
 			if err == io.EOF {
 				b.error("chat eof:", err)
@@ -1723,47 +1743,50 @@ LOOP:
 			}
 		}
 		for _, clb := range b.wsCallbacks {
-			go clb(buf[0:n])
+			go clb([]byte(buf))
 		}
-		msg := bytes.Trim(buf, "\x00")
-		if bytes.Equal(msg, []byte("3probe")) {
-			_, _ = b.ws.Write([]byte("5"))
-			_, _ = b.ws.Write([]byte("40/chat,"))
-			_, _ = b.ws.Write([]byte(`40/auctioneer,`))
-		} else if bytes.Equal(msg, []byte("2")) {
-			_, _ = b.ws.Write([]byte("3"))
-		} else if regexp.MustCompile(`40/auctioneer,{"sid":"[^"]+"}`).Match(msg) {
+		if buf == "3probe" {
+			_ = websocket.Message.Send(b.ws, "5")
+			_ = websocket.Message.Send(b.ws, "40/chat,")
+			_ = websocket.Message.Send(b.ws, "40/auctioneer,")
+		} else if buf == "2" {
+			_ = websocket.Message.Send(b.ws, "3")
+		} else if regexp.MustCompile(`40/auctioneer,{"sid":"[^"]+"}`).MatchString(buf) {
 			b.debug("got auctioneer sid")
-		} else if regexp.MustCompile(`40/chat,{"sid":"[^"]+"}`).Match(msg) {
+		} else if regexp.MustCompile(`40/chat,{"sid":"[^"]+"}`).MatchString(buf) {
 			b.debug("got chat sid")
-			_, _ = b.ws.Write([]byte(`42/chat,` + strconv.FormatInt(b.sessionChatCounter, 10) + `["authorize","` + b.ogameSession + `"]`))
+			_ = websocket.Message.Send(b.ws, `42/chat,`+strconv.FormatInt(b.sessionChatCounter, 10)+`["authorize","`+b.ogameSession+`"]`)
 			b.sessionChatCounter++
-		} else if regexp.MustCompile(`43/chat,\d+\[true]`).Match(msg) {
+		} else if regexp.MustCompile(`43/chat,\d+\[true]`).MatchString(buf) {
 			b.debug("chat connected")
-		} else if regexp.MustCompile(`43/chat,\d+\[false]`).Match(msg) {
+		} else if regexp.MustCompile(`43/chat,\d+\[false]`).MatchString(buf) {
 			b.error("Failed to connect to chat")
-		} else if bytes.HasPrefix(msg, []byte(`42/chat,["chat",`)) {
-			payload := bytes.TrimPrefix(msg, []byte(`42/chat,["chat",`))
-			payload = bytes.TrimSuffix(payload, []byte(`]`))
+		} else if strings.HasPrefix(buf, `42/chat,["chat",`) {
+			payload := strings.TrimPrefix(buf, `42/chat,["chat",`)
+			payload = strings.TrimSuffix(payload, `]`)
 			var chatMsg ChatMsg
-			if err := json.Unmarshal(payload, &chatMsg); err != nil {
+			if err := json.Unmarshal([]byte(payload), &chatMsg); err != nil {
 				b.error("Unable to unmarshal chat payload", err, payload)
 				continue
 			}
 			for _, clb := range b.chatCallbacks {
 				clb(chatMsg)
 			}
-		} else if regexp.MustCompile(`^\d+/auctioneer`).Match(msg) {
+		} else if regexp.MustCompile(`^\d+/auctioneer`).MatchString(buf) {
 			// 42/auctioneer,["timeLeft","<span style=\"color:#99CC00;\"><b>approx. 30m</b></span> remaining until the auction ends"] // every minute
 			// 42/auctioneer,["timeLeft","Next auction in:<br />\n<span class=\"nextAuction\" id=\"nextAuction\">117</span>"]
 			// 42/auctioneer,["new bid",{"player":{"id":219657,"name":"Payback","link":"https://s129-en.ogame.gameforge.com/game/index.php?page=ingame&component=galaxy&galaxy=2&system=146"},"sum":5000,"price":6000,"bids":5,"auctionId":"42894"}]
 			// 42/auctioneer,["new auction",{"info":"<span style=\"color:#99CC00;\"><b>approx. 35m</b></span> remaining until the auction ends","item":{"uuid":"0968999df2fe956aa4a07aea74921f860af7d97f","image":"55d4b1750985e4843023d7d0acd2b9bafb15f0b7","rarity":"rare"},"oldAuction":{"item":{"uuid":"3c9f85221807b8d593fa5276cdf7af9913c4a35d","imageSmall":"286f3eaf6072f55d8858514b159d1df5f16a5654","rarity":"common"},"time":"20.05.2021 08:42:07","bids":5,"sum":5000,"player":{"id":219657,"name":"Payback","link":"http://s129-en.ogame.gameforge.com/game/index.php?page=ingame&component=galaxy&galaxy=2&system=146"}},"auctionId":42895}]
 			// 42/auctioneer,["auction finished",{"sum":5000,"player":{"id":219657,"name":"Payback","link":"http://s129-en.ogame.gameforge.com/game/index.php?page=ingame&component=galaxy&galaxy=2&system=146"},"bids":5,"info":"Next auction in:<br />\n<span class=\"nextAuction\" id=\"nextAuction\">1072</span>","time":"08:42"}]
-			parts := bytes.SplitN(msg, []byte(","), 2)
+			parts := strings.SplitN(buf, ",", 2)
 			msg := parts[1]
-			var pck interface{} = string(msg)
+			var pck interface{} = msg
 			var out []interface{}
-			_ = json.Unmarshal(msg, &out)
+			_ = json.Unmarshal([]byte(msg), &out)
+			if len(out) == 0 {
+				b.error("unknown message received:", buf)
+				continue
+			}
 			if name, ok := out[0].(string); ok {
 				arg := out[1]
 				if name == "new bid" {
@@ -1831,7 +1854,7 @@ LOOP:
 				clb(pck)
 			}
 		} else {
-			b.error("unknown message received:", string(buf))
+			b.error("unknown message received:", buf)
 			time.Sleep(time.Second)
 		}
 	}
@@ -2072,7 +2095,7 @@ func (b *OGame) ReconnectChat() bool {
 	if b.ws == nil {
 		return false
 	}
-	_, _ = b.ws.Write([]byte("1::/chat"))
+	_ = websocket.Message.Send(b.ws, "1::/chat")
 	return true
 }
 
@@ -2144,7 +2167,6 @@ func IsKnowFullPage(vals url.Values) bool {
 		page == PreferencesPage ||
 		page == MessagesPage ||
 		page == ChatPage ||
-
 		page == DefensesPage ||
 		page == SuppliesPage ||
 		page == FacilitiesPage ||
@@ -2931,7 +2953,7 @@ func CalcFlightTime(origin, destination Coordinate, universeSize, nbSystems int6
 // CalcFlightTime calculates the flight time and the fuel consumption
 func (b *OGame) CalcFlightTime(origin, destination Coordinate, speed float64, ships ShipsInfos, missionID MissionID) (secs, fuel int64) {
 	return CalcFlightTime(origin, destination, b.serverData.Galaxies, b.serverData.Systems, b.serverData.DonutGalaxy,
-		b.serverData.DonutSystem, b.serverData.GlobalDeuteriumSaveFactor, speed, GetFleetSpeedForMission(b.IsV81(), b.serverData, missionID), ships,
+		b.serverData.DonutSystem, b.serverData.GlobalDeuteriumSaveFactor, speed, GetFleetSpeedForMission(b.serverData, missionID), ships,
 		b.GetCachedResearch(), b.characterClass)
 }
 
@@ -3032,6 +3054,7 @@ func (b *OGame) headersForPage(url string) (http.Header, error) {
 		return nil, err
 	}
 	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, resp.Body)
 
 	if resp.StatusCode >= 500 {
 		return nil, err
@@ -3677,11 +3700,18 @@ func (b *OGame) getAttacks(opts ...Option) (out []AttackEvent, err error) {
 	if err != nil {
 		return
 	}
-	out, err = b.extractor.ExtractAttacks(pageHTML)
+	ownCoords := make([]Coordinate, 0)
+	planets := b.GetCachedPlanets()
+	for _, planet := range planets {
+		ownCoords = append(ownCoords, planet.Coordinate)
+		if planet.Moon != nil {
+			ownCoords = append(ownCoords, planet.Moon.Coordinate)
+		}
+	}
+	out, err = b.extractor.ExtractAttacks(pageHTML, ownCoords)
 	if err != nil {
 		return
 	}
-	planets := b.GetCachedPlanets()
 	fixAttackEvents(out, planets)
 	return
 }
@@ -3834,9 +3864,9 @@ func (b *OGame) IsV8() bool {
 	return len(b.ServerVersion()) > 0 && b.ServerVersion()[0] == '8'
 }
 
-// IsV81 ...
-func (b *OGame) IsV81() bool {
-	return len(b.ServerVersion()) > 0 && strings.HasPrefix(b.ServerVersion(), "8.1")
+// IsV9 ...
+func (b *OGame) IsV9() bool {
+	return len(b.ServerVersion()) > 0 && b.ServerVersion()[0] == '9'
 }
 
 func getToken(b *OGame, page string, celestialID CelestialID) (string, error) {
@@ -3924,14 +3954,11 @@ func (b *OGame) build(celestialID CelestialID, id ID, nbr int64) error {
 		"cp":        {strconv.FormatInt(int64(celestialID), 10)},
 	}
 
-	// Techs don't have a token
-	if !id.IsTech() {
-		token, err := getToken(b, page, celestialID)
-		if err != nil {
-			return err
-		}
-		vals.Add("token", token)
+	token, err := getToken(b, page, celestialID)
+	if err != nil {
+		return err
 	}
+	vals.Add("token", token)
 
 	if id.IsDefense() || id.IsShip() {
 		var maximumNbr int64 = 99999
@@ -3954,7 +3981,7 @@ func (b *OGame) build(celestialID CelestialID, id ID, nbr int64) error {
 		return err
 	}
 
-	_, err := b.getPageContent(vals)
+	_, err = b.getPageContent(vals)
 	return err
 }
 
@@ -4313,7 +4340,7 @@ func (b *OGame) sendFleet(celestialID CelestialID, ships []Quantifiable, speed S
 	}
 
 	tokenM := regexp.MustCompile(`var fleetSendingToken = "([^"]+)";`).FindSubmatch(pageHTML)
-	if b.IsV8() {
+	if b.IsV8() || b.IsV9() {
 		tokenM = regexp.MustCompile(`var token = "([^"]+)";`).FindSubmatch(pageHTML)
 	}
 	if len(tokenM) != 2 {
@@ -4388,7 +4415,7 @@ func (b *OGame) sendFleet(celestialID CelestialID, ships []Quantifiable, speed S
 	newResources.Deuterium = MaxInt(newResources.Deuterium, 0)
 
 	// Page 3 : select coord, mission, speed
-	if b.IsV8() {
+	if b.IsV8() || b.IsV9() {
 		payload.Set("token", checkRes.NewAjaxToken)
 	}
 	payload.Set("speed", strconv.FormatInt(int64(speed), 10))
